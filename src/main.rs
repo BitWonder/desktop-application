@@ -3,12 +3,6 @@
 // Iced backend for Plotters
 // Copyright: 2022, Joylei <leingliu@gmail.com>
 // License: MIT
-
-extern crate iced;
-extern crate plotters;
-extern crate rand;
-extern crate tokio;
-
 use chrono::{DateTime, Utc};
 use iced::{
     font,
@@ -24,7 +18,6 @@ use plotters_iced::{
     sample::lttb::{DataPoint, LttbSource},
     Chart, ChartWidget, Renderer,
 };
-use rand::Rng;
 use std::{fs::File, io::Read, time::Duration};
 use std::{collections::VecDeque, time::Instant};
 
