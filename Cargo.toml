@@ -5,9 +5,11 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4.38"
-iced = "0.13.1"
+iced = {version = "0.13.1", features = ["smol"]}
+iced_futures = "0.13.2"
 plotters = "0.3.7"
 plotters-backend = "0.3.7"
 plotters-iced = "0.11.0"
 rand = "0.8.5"
+serialport = "4.5.1"
 tokio = { version = "1.40.0", features = ["full"] }

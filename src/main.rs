@@ -5,12 +5,9 @@
 // License: MIT
 use chrono::{DateTime, Utc};
 use iced::{
-    font,
-    widget::{
-        canvas::{Cache, Frame, Geometry},
-        Column, Container, Text,
-    },
-    Alignment, Element, Font, Length, Size, Task,
+    font, futures::lock::Mutex, widget::{
+        button, canvas::{Cache, Frame, Geometry}, Column, Container, Text
+    }, Alignment, Element, Font, Length, Size, Subscription, Task
 };
 use plotters::prelude::ChartBuilder;
 use plotters_backend::DrawingBackend;
@@ -18,8 +15,11 @@ use plotters_iced::{
     sample::lttb::{DataPoint, LttbSource},
     Chart, ChartWidget, Renderer,
 };
-use std::{fs::File, io::Read, time::Duration};
+use std::{fs::File, io::Read, sync::Arc, time::Duration};
 use std::{collections::VecDeque, time::Instant};
+use std::{time::UNIX_EPOCH, io::Write};
+
+use serialport::StopBits;
 
 const TITLE_FONT_SIZE: u16 = 22;
 
@@ -31,12 +31,25 @@ const FONT_BOLD: Font = Font {
 
 #[tokio::main]
 async fn main() {
+    let link: Arc<Mutex<Vec<(DateTime<Utc>, f32)>>> = Arc::new(Mutex::new(vec![(chrono::DateTime::from_timestamp_millis(std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64).unwrap(), 0.0)]));
+    let state_link = Arc::clone(&link);
+
+    tokio::spawn(generate_new_data(link));
+
     iced::application("Large Data Example", State::update, State::view)
+        .subscription(subscription)
         .antialiasing(true)
         .default_font(Font::with_name("Noto Sans"))
-        .run_with(State::new)
+        .run_with(|| State::new(state_link))
         .unwrap();
 }
+
+fn subscription(_state: &State) -> Subscription<Message> {
+    iced::time::every(Duration::from_secs(1)).map(move |_| {
+        Message::ReloadData
+    })
+}
+
 
 struct Wrapper<'a>(&'a DateTime<Utc>, &'a f32);
 
@@ -51,27 +64,29 @@ impl DataPoint for Wrapper<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Message {
     FontLoaded(Result<(), font::Error>),
     DataLoaded(Vec<(DateTime<Utc>, f32)>),
     Sampled(Vec<(DateTime<Utc>, f32)>),
+    ReloadData
 }
 
 struct State {
     chart: Option<ExampleChart>,
+    data: Arc<Mutex<Vec<(DateTime<Utc>, f32)>>>
 }
 
 impl State {
-    fn new() -> (Self, Task<Message>) {
+    fn new(data: Arc<Mutex<Vec<(DateTime<Utc>, f32)>>>) -> (Self, Task<Message>) {
         (
-            Self { chart: None },
+            Self { chart: None, data: data.clone() },
             Task::batch([
                 font::load(include_bytes!("./fonts/notosans-regular.ttf").as_slice())
                     .map(Message::FontLoaded),
                 font::load(include_bytes!("./fonts/notosans-bold.ttf").as_slice())
                     .map(Message::FontLoaded),
-                Task::perform(tokio::task::spawn_blocking(generate_data), |data| {
+                Task::perform(tokio::task::spawn(generate_data(data.clone())), |data| {
                     Message::DataLoaded(data.unwrap())
                 }),
             ]),
@@ -96,6 +111,11 @@ impl State {
             Message::Sampled(sampled) => {
                 self.chart = Some(ExampleChart::new(sampled.into_iter()));
                 Task::none()
+            },
+            Message::ReloadData => {
+                Task::perform(tokio::task::spawn(generate_data(self.data.clone())), |data| {
+                    Message::DataLoaded(data.unwrap())
+                })
             }
             _ => Task::none(),
         }
@@ -107,15 +127,16 @@ impl State {
             .align_x(Alignment::Start)
             .width(Length::Fill)
             .height(Length::Fill)
-            .push(
+            .push( // header
                 Text::new("Iced test chart")
                     .size(TITLE_FONT_SIZE)
                     .font(FONT_BOLD),
             )
-            .push(match self.chart {
+            .push(match self.chart { // chart
                 Some(ref chart) => chart.view(),
                 None => Text::new("Loading...").into(),
-            });
+            })
+            .push(button("Reload Chart").on_press(Message::ReloadData));
 
         Container::new(content)
             .padding(5)
@@ -194,10 +215,10 @@ impl Chart<Message> for ExampleChart {
         //dbg!(&newest_time);
         //dbg!(&oldest_time);
         let mut chart = chart
-            .x_label_area_size(0)
-            .y_label_area_size(28)
+            .x_label_area_size(20)
+            .y_label_area_size(80)
             .margin(20)
-            .build_cartesian_2d(oldest_time..newest_time, self.data_points.front().unwrap().1..self.data_points.back().unwrap().1)
+            .build_cartesian_2d(oldest_time..newest_time, self.data_points.clone().into_iter().min_by_key(|x| x.1 as u64).unwrap().1 as f32..self.data_points.clone().into_iter().max_by_key(|x| x.1 as u64).unwrap().1 as f32)
             .expect("failed to build chart");
 
         chart
@@ -213,6 +234,14 @@ impl Chart<Message> for ExampleChart {
                     .transform(FontTransform::Rotate90),
             )
             .y_label_formatter(&|y| format!("{}", y))
+            .x_labels(5)
+            .x_label_style(
+                ("Noto Sans", 15)
+                    .into_font()
+                    .color(&plotters::style::colors::BLUE.mix(0.65))
+                    .transform(FontTransform::Rotate90),
+            )
+            .x_label_formatter(&|y| format!("{}", y))
             .draw()
             .expect("failed to draw chart mesh");
 
@@ -229,17 +258,24 @@ impl Chart<Message> for ExampleChart {
     }
 }
 
-fn generate_data() -> Vec<(DateTime<Utc>, f32)> {
-    let mut f: File = File::open("./graph_testing_data/x_2x_amount_of_primes.csv").unwrap();
+async fn generate_data(save_data: Arc<Mutex<Vec<(DateTime<Utc>, f32)>>>) -> Vec<(DateTime<Utc>, f32)> {
+    /*let mut f: File = File::open("./graph_testing_data/value_of_bpm_at_1729445874626.csv").unwrap();
     let mut buffer: String = String::new();
     f.read_to_string(&mut buffer).unwrap();
     let data: Vec<(DateTime<Utc>, f32)> = buffer.split("\n").map(|x| {
-        let a: Vec<u32> = x.split(",").map(|x| x.trim().parse::<u32>().unwrap()).collect();
-        let t: DateTime<Utc> = DateTime::<Utc>::from_timestamp(a[0] as i64, 0).unwrap();
-        let p: f32 = a[1] as f32;
+        let a: Vec<u64> = x.split(",").map(|x| x.trim().parse::<u64>().unwrap_or(1)).collect();
+        let t: DateTime<Utc> = DateTime::<Utc>::from_timestamp_millis(a[0] as i64).unwrap();
+        let p: f32;
+        if a.len() <= 1 {
+            p = 100.0;
+        } else { // this will be last line so be curr time
+            p = a[1] as f32;
+        }
         (t, p)
     }).collect();
-    return data;
+    return data;*/
+    let data = save_data.lock().await;
+    return data.to_vec();
     /*let total = 10_000_000;
     let mut data = Vec::new();
     let mut rng = rand::thread_rng();
@@ -265,4 +301,55 @@ fn generate_data() -> Vec<(DateTime<Utc>, f32)> {
     data.sort_by_cached_key(|x| x.0);
     //dbg!(&data[..100]);
     data*/
+}
+
+async fn generate_new_data(save_data: Arc<Mutex<Vec<(DateTime<Utc>, f32)>>>) {
+    let mut f: File = File::create("./graph_testing_data/value_of_bpm_at_1729445874626.csv").unwrap();
+    let ports = serialport::available_ports().expect("No ports found!");
+    for p in ports.clone() {
+        println!("{}", p.port_name);
+    }
+
+    if ports[0].port_name.clone() != "/dev/ttyACM0" {
+        return;
+    }
+
+    let mut port = serialport::new(ports[0].port_name.clone(), 9600)
+        .stop_bits(StopBits::One)
+        .parity(serialport::Parity::Even)
+        .timeout(std::time::Duration::from_millis(1000)) // wait one full second for data to flow
+        .open().expect("Failed to open port");
+
+    dbg!(port.try_clone().unwrap());
+
+    let _ = port.write(b"\r\n");
+    let mut x: usize = 0;
+    let mut pulse_value: Vec<char> = Vec::new();
+    let mut current_time: u64 = 0;
+    loop {
+        // let _ = port.write(format!("Hello from Rust: serialport try: {x}!\r").as_bytes());
+        let mut serial_buf: [u8; 1] = [0];
+        let _ = port.read_exact(&mut serial_buf);
+        //(0..3).into_iter().for_each(|_|{  serial_buf.pop(); });
+        if serial_buf[0].is_ascii_digit() {
+            pulse_value.push(char::from_u32(serial_buf[0] as u32).unwrap());
+            if current_time == 0 {
+                current_time = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            }
+        }
+        else if pulse_value.len() > 0 {
+            let intermediatery_value: String = pulse_value.iter().collect::<String>();
+            let value = intermediatery_value.parse::<usize>().unwrap();
+            writeln!(f, "{},{}", current_time,value).unwrap(); // cur time x and pulse val y
+            // send to linked data
+            let mut data = save_data.lock().await;
+            data.push((DateTime::from_timestamp_millis(current_time as i64).unwrap(), value as f32));
+            pulse_value.clear(); // remove data to make way for new data
+            current_time = 0;
+        }
+        else {
+            x = x.wrapping_add(1);
+            //println!("{x}");
+        }
+    }
 }
